@@ -1,0 +1,166 @@
+
+import json
+import re
+from pathlib import Path
+
+from pyspark.sql.functions import (
+    col,
+    lit,
+    when,
+    array,
+    filter as array_filter,
+    explode,
+    size
+)
+
+
+# --------------------------------------------------
+# 1. PROJECT PATHS
+# --------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+ALIAS_PATH = (
+    PROJECT_ROOT
+    / "silver_news"
+    / "config"
+    / "company_aliases.json"
+)
+
+
+# --------------------------------------------------
+# 2. LOAD COMPANY ALIASES
+# --------------------------------------------------
+
+def load_company_aliases():
+
+    if not ALIAS_PATH.exists():
+        raise FileNotFoundError(
+            f"Alias file not found: {ALIAS_PATH}"
+        )
+
+    with open(
+        ALIAS_PATH,
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        company_aliases = json.load(file)
+
+    print(
+        "Number of companies loaded:",
+        len(company_aliases)
+    )
+
+    return company_aliases
+
+
+# --------------------------------------------------
+# 3. EXTRACT TICKERS
+# --------------------------------------------------
+
+def extract_tickers(cleaned_df):
+
+    print("\n========== STARTING TICKER EXTRACTION ==========")
+
+    company_aliases = load_company_aliases()
+
+    analysis_text = col("text_for_analysis")
+
+    ticker_conditions = []
+
+    for ticker, aliases in company_aliases.items():
+
+        patterns = []
+
+        for alias in aliases:
+
+            escaped_alias = re.escape(alias)
+
+            pattern = (
+                r"(?i)(^|[^A-Za-z0-9])"
+                + escaped_alias
+                + r"([^A-Za-z0-9]|$)"
+            )
+
+            patterns.append(pattern)
+
+        combined_pattern = "|".join(patterns)
+
+        condition = analysis_text.rlike(
+            combined_pattern
+        )
+
+        ticker_conditions.append(
+            when(condition, lit(ticker))
+        )
+
+    # Create an array containing matched tickers.
+    df_with_tickers = cleaned_df.withColumn(
+        "matched_tickers",
+        array_filter(
+            array(*ticker_conditions),
+            lambda ticker: ticker.isNotNull()
+        )
+    )
+
+    # --------------------------------------------------
+    # 4. EXTRACTION SUMMARY
+    # --------------------------------------------------
+
+    total_articles = df_with_tickers.count()
+
+    matched_articles = (
+        df_with_tickers
+        .filter(size(col("matched_tickers")) > 0)
+        .count()
+    )
+
+    unmatched_articles = (
+        total_articles - matched_articles
+    )
+
+    print("\n========== TICKER EXTRACTION RESULTS ==========")
+
+    print("Total articles:", total_articles)
+    print("Articles with tickers:", matched_articles)
+    print("Articles without tickers:", unmatched_articles)
+
+    # --------------------------------------------------
+    # 5. CREATE NEWS BY TICKER
+    # --------------------------------------------------
+
+    news_by_ticker_df = (
+        df_with_tickers
+        .withColumn(
+            "ticker",
+            explode(col("matched_tickers"))
+        )
+    )
+
+    mapping_count = news_by_ticker_df.count()
+
+    print(
+        "Total article-ticker mappings:",
+        mapping_count
+    )
+
+    print("\nARTICLE-LEVEL TICKER RESULTS:")
+
+    df_with_tickers.select(
+        "article_id",
+        "cleaned_headline",
+        "matched_tickers"
+    ).show(truncate=False)
+
+    print("\nNEWS BY TICKER RESULTS:")
+
+    news_by_ticker_df.select(
+        "article_id",
+        "ticker",
+        "cleaned_headline"
+    ).show(truncate=False)
+
+    print("\nTICKER EXTRACTION COMPLETED!")
+
+    return df_with_tickers, news_by_ticker_df
